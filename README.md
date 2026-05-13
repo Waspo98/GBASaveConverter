@@ -1,0 +1,157 @@
+# GBASaveConverter
+
+GBASaveConverter is a small Windows service that keeps Game Boy Advance battery save files paired between RetroArch/mGBA and standalone GBA emulators.
+
+RetroArch's mGBA core commonly uses `.srm` battery saves. Some standalone emulators use `.sav` for the same underlying save data. GBASaveConverter watches a save folder and keeps matching files in sync:
+
+```text
+Game Name.srm
+Game Name.sav
+```
+
+When one side changes, the service waits briefly, compares the two files, and copies the newest version to the other extension.
+
+This was built for a Syncthing setup where RetroArch devices and an Android standalone emulator share the same save folder. It has only been tested with Pizza Boy GBA as the standalone Android emulator.
+
+## What It Does
+
+- Watches one folder for `.srm` and `.sav` files.
+- Creates the missing twin when only one extension exists.
+- Syncs `.srm` to `.sav` or `.sav` to `.srm`, depending on which file is newer.
+- Compares file hashes before copying, so identical pairs are left alone.
+- Debounces file events before syncing so it does not copy half-written saves.
+- Ignores its own recent writes to avoid event loops.
+- Runs a startup reconciliation scan and periodic safety scans.
+- Backs up overwritten files before replacing them.
+- Runs as an automatic Windows service.
+
+## Default Layout
+
+The default config watches:
+
+```text
+C:\RetroArch\saves\mGBA
+```
+
+With a save named `Pokemon FireRed`, the folder can contain:
+
+```text
+C:\RetroArch\saves\mGBA\Pokemon FireRed.srm
+C:\RetroArch\saves\mGBA\Pokemon FireRed.sav
+```
+
+RetroArch can use the `.srm` file, while Pizza Boy GBA can use the `.sav` file.
+
+## Safety Model
+
+GBASaveConverter is intentionally conservative:
+
+- It waits `DebounceSeconds` before acting on changes.
+- It checks that the file appears stable before reading it.
+- It hashes both files before copying.
+- It only overwrites when the contents differ.
+- If both files exist and differ, newest modified time wins.
+- Before overwriting an existing file, it writes a timestamped backup under `backups\YYYYMMDD`.
+
+The main edge case is playing the same game on two devices before Syncthing has finished syncing both sides. In that case, newest modified time wins, and the older overwritten target is backed up.
+
+## Requirements
+
+- Windows
+- .NET Framework 4.x, included with modern Windows installs
+- PowerShell for the helper scripts
+
+No .NET SDK is required. The build script uses the built-in .NET Framework C# compiler at:
+
+```text
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+```
+
+## Build
+
+```powershell
+.\scripts\Build-GBASaveConverter.ps1
+```
+
+This creates:
+
+```text
+GBASaveConverter.exe
+```
+
+## Configure
+
+Copy the example config:
+
+```powershell
+Copy-Item .\GBASaveConverter.ini.example .\GBASaveConverter.ini
+```
+
+Edit `GBASaveConverter.ini` as needed:
+
+```ini
+SaveDirectory=C:\RetroArch\saves\mGBA
+LogDirectory=logs
+BackupDirectory=backups
+BackupBeforeOverwrite=true
+DebounceSeconds=5
+FullScanMinutes=10
+IgnoreOwnWritesSeconds=10
+StabilityCheckMilliseconds=500
+LogToConsole=true
+```
+
+## Run One Reconciliation Scan
+
+Useful before installing the service:
+
+```powershell
+.\scripts\Run-Once.ps1
+```
+
+## Install As A Windows Service
+
+Run PowerShell as Administrator:
+
+```powershell
+.\scripts\Install-GBASaveConverterService.ps1
+```
+
+The service is installed as:
+
+```text
+GBASaveConverter
+```
+
+It starts automatically on boot.
+
+Useful service commands:
+
+```powershell
+Get-Service GBASaveConverter
+Stop-Service GBASaveConverter
+Start-Service GBASaveConverter
+```
+
+## Uninstall The Service
+
+Run PowerShell as Administrator:
+
+```powershell
+.\scripts\Uninstall-GBASaveConverterService.ps1
+```
+
+## Logs And Backups
+
+By default:
+
+```text
+logs\GBASaveConverter.log
+backups\YYYYMMDD\*.bak
+```
+
+Logs, backups, local config, and build output are ignored by Git.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).

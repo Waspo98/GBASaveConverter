@@ -1,0 +1,11 @@
+# GBASaveConverter
+# Keeps Pizza Boy .sav and RetroArch .srm battery saves paired.
+SaveDirectory=C:\RetroArch\saves\mGBA
+LogDirectory=logs
+BackupDirectory=backups
+BackupBeforeOverwrite=true
+DebounceSeconds=5
+FullScanMinutes=10
+IgnoreOwnWritesSeconds=10
+StabilityCheckMilliseconds=500
+LogToConsole=true

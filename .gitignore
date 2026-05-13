@@ -1,0 +1,19 @@
+# Build output
+*.exe
+*.dll
+*.pdb
+bin/
+obj/
+
+# Local runtime state
+GBASaveConverter.ini
+logs/
+backups/
+tmp-test/
+
+# Editor/system files
+.vs/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
