@@ -23,6 +23,7 @@ This was built for a Syncthing setup where RetroArch devices and an Android stan
 - Ignores its own recent writes to avoid event loops.
 - Runs a startup reconciliation scan and periodic safety scans.
 - Backs up overwritten files before replacing them.
+- Optionally calls Syncthing's local API after writes so Docker-hosted Syncthing notices converted files immediately.
 - Runs as an automatic Windows service.
 
 ## Default Layout
@@ -52,6 +53,7 @@ GBASaveConverter is intentionally conservative:
 - It only overwrites when the contents differ.
 - If both files exist and differ, newest modified time wins.
 - Before overwriting an existing file, it writes a timestamped backup under `backups\YYYYMMDD`.
+- Files with `.sync-conflict-` in the name are ignored so Syncthing conflict copies are not treated as normal save pairs.
 
 The main edge case is playing the same game on two devices before Syncthing has finished syncing both sides. In that case, newest modified time wins, and the older overwritten target is backed up.
 
@@ -94,12 +96,35 @@ SaveDirectory=C:\RetroArch\saves\mGBA
 LogDirectory=logs
 BackupDirectory=backups
 BackupBeforeOverwrite=true
+SyncthingScanAfterWrite=false
+SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
+SyncthingApiKey=
+SyncthingFolderId=
+SyncthingScanSubdirectory=
 DebounceSeconds=5
 FullScanMinutes=10
 IgnoreOwnWritesSeconds=10
 StabilityCheckMilliseconds=500
 LogToConsole=true
 ```
+
+## Syncthing Scan Hook
+
+If Syncthing runs in Docker on Windows, filesystem watcher events from host bind mounts may not reliably reach the Syncthing container. In that setup, Syncthing might not notice that GBASaveConverter created or updated a paired save until a periodic rescan.
+
+Enable the scan hook to request an immediate Syncthing scan for the source and converted target after each conversion:
+
+```ini
+SyncthingScanAfterWrite=true
+SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
+SyncthingApiKey=your-local-syncthing-api-key
+SyncthingFolderId=your-syncthing-folder-id
+SyncthingScanSubdirectory=mGBA
+```
+
+For a Syncthing folder rooted at `C:\RetroArch\saves` and saves in `C:\RetroArch\saves\mGBA`, use `SyncthingScanSubdirectory=mGBA`.
+
+Keep `GBASaveConverter.ini` private. It can contain your Syncthing API key and is ignored by Git.
 
 ## Run One Reconciliation Scan
 
@@ -132,6 +157,16 @@ Get-Service GBASaveConverter
 Stop-Service GBASaveConverter
 Start-Service GBASaveConverter
 ```
+
+## Deploy An Update
+
+Run PowerShell as Administrator:
+
+```powershell
+.\scripts\Deploy-GBASaveConverterService.ps1
+```
+
+This stops the service, rebuilds `GBASaveConverter.exe`, and starts the service again.
 
 ## Uninstall The Service
 

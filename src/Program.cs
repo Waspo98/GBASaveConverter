@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Security.Cryptography;
 using System.ServiceProcess;
 using System.Text;
@@ -282,6 +283,7 @@ namespace GBASaveConverter
     internal sealed class SaveConverter
     {
         private readonly Logger logger;
+        private readonly SyncthingScanner syncthingScanner;
 
         public ConverterConfig Config { get; private set; }
 
@@ -289,6 +291,7 @@ namespace GBASaveConverter
         {
             Config = config;
             this.logger = logger;
+            syncthingScanner = new SyncthingScanner(config, logger);
         }
 
         public bool ReconcileAll(string reason)
@@ -409,6 +412,8 @@ namespace GBASaveConverter
             File.Copy(source, target, true);
             File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(source));
             logger.Info("Synced " + Path.GetFileName(source) + " -> " + Path.GetFileName(target) + " (" + reason + ").");
+            syncthingScanner.ScanFile(source);
+            syncthingScanner.ScanFile(target);
         }
 
         private void BackupFile(string path)
@@ -464,6 +469,12 @@ namespace GBASaveConverter
 
         public static bool IsSaveFile(string path)
         {
+            var fileName = Path.GetFileName(path);
+            if (fileName.IndexOf(".sync-conflict-", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
             var extension = Path.GetExtension(path);
             return extension.Equals(".sav", StringComparison.OrdinalIgnoreCase) ||
                 extension.Equals(".srm", StringComparison.OrdinalIgnoreCase);
@@ -482,6 +493,11 @@ namespace GBASaveConverter
         public string BackupDirectory { get; private set; }
         public bool BackupBeforeOverwrite { get; private set; }
         public bool LogToConsole { get; private set; }
+        public bool SyncthingScanAfterWrite { get; private set; }
+        public string SyncthingApiBaseUrl { get; private set; }
+        public string SyncthingApiKey { get; private set; }
+        public string SyncthingFolderId { get; private set; }
+        public string SyncthingScanSubdirectory { get; private set; }
         public TimeSpan DebounceInterval { get; private set; }
         public TimeSpan FullScanInterval { get; private set; }
         public TimeSpan IgnoreOwnWritesInterval { get; private set; }
@@ -505,6 +521,11 @@ namespace GBASaveConverter
                 BackupDirectory = ResolvePath(appDirectory, Get(values, "BackupDirectory", "backups")),
                 BackupBeforeOverwrite = GetBool(values, "BackupBeforeOverwrite", true),
                 LogToConsole = GetBool(values, "LogToConsole", true),
+                SyncthingScanAfterWrite = GetBool(values, "SyncthingScanAfterWrite", false),
+                SyncthingApiBaseUrl = Get(values, "SyncthingApiBaseUrl", "http://127.0.0.1:8384/rest"),
+                SyncthingApiKey = Get(values, "SyncthingApiKey", ""),
+                SyncthingFolderId = Get(values, "SyncthingFolderId", ""),
+                SyncthingScanSubdirectory = Get(values, "SyncthingScanSubdirectory", ""),
                 DebounceInterval = TimeSpan.FromSeconds(GetInt(values, "DebounceSeconds", 5, 1, 120)),
                 FullScanInterval = TimeSpan.FromMinutes(GetInt(values, "FullScanMinutes", 10, 1, 1440)),
                 IgnoreOwnWritesInterval = TimeSpan.FromSeconds(GetInt(values, "IgnoreOwnWritesSeconds", 10, 1, 300)),
@@ -524,6 +545,11 @@ SaveDirectory=C:\RetroArch\saves\mGBA
 LogDirectory=logs
 BackupDirectory=backups
 BackupBeforeOverwrite=true
+SyncthingScanAfterWrite=false
+SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
+SyncthingApiKey=
+SyncthingFolderId=
+SyncthingScanSubdirectory=
 DebounceSeconds=5
 FullScanMinutes=10
 IgnoreOwnWritesSeconds=10
@@ -558,6 +584,63 @@ LogToConsole=true
         private static string ResolvePath(string baseDirectory, string path)
         {
             return Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(baseDirectory, path));
+        }
+    }
+
+    internal sealed class SyncthingScanner
+    {
+        private readonly ConverterConfig config;
+        private readonly Logger logger;
+
+        public SyncthingScanner(ConverterConfig config, Logger logger)
+        {
+            this.config = config;
+            this.logger = logger;
+        }
+
+        public void ScanFile(string path)
+        {
+            if (!config.SyncthingScanAfterWrite) return;
+            if (string.IsNullOrWhiteSpace(config.SyncthingApiKey) || string.IsNullOrWhiteSpace(config.SyncthingFolderId))
+            {
+                logger.Info("Syncthing scan is enabled but SyncthingApiKey or SyncthingFolderId is missing.");
+                return;
+            }
+
+            try
+            {
+                var subPath = BuildSyncthingSubPath(path);
+                var url = config.SyncthingApiBaseUrl.TrimEnd('/') +
+                    "/db/scan?folder=" + Uri.EscapeDataString(config.SyncthingFolderId) +
+                    "&sub=" + Uri.EscapeDataString(subPath);
+
+                var request = (HttpWebRequest)WebRequest.Create(url);
+                request.Method = "POST";
+                request.Timeout = 10000;
+                request.ReadWriteTimeout = 10000;
+                request.Headers["X-API-Key"] = config.SyncthingApiKey;
+                request.ContentLength = 0;
+
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    logger.Info("Requested Syncthing scan for " + subPath + " (" + (int)response.StatusCode + ").");
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.Error("Failed to request Syncthing scan for " + path + ".", ex);
+            }
+        }
+
+        private string BuildSyncthingSubPath(string path)
+        {
+            var fileName = Path.GetFileName(path);
+            var subdirectory = (config.SyncthingScanSubdirectory ?? string.Empty)
+                .Trim()
+                .Trim('/', '\\')
+                .Replace('\\', '/');
+
+            return subdirectory.Length == 0 ? fileName : subdirectory + "/" + fileName;
         }
     }
 
