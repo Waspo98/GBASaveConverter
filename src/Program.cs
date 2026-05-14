@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -20,41 +19,73 @@ namespace GBASaveConverter
             var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
             var configPath = GetConfigPath(args, Path.Combine(baseDirectory, "GBASaveConverter.ini"));
             var config = ConverterConfig.Load(configPath);
-            var logger = new Logger(config.LogDirectory, config.LogToConsole || args.Any(IsConsoleArg));
-            var converter = new SaveConverter(config, logger);
+            var dryRun = args.Any(IsDryRunArg);
+            var status = args.Any(IsStatusArg);
+            var logger = new Logger(config.LogDirectory, config.LogToConsole || args.Any(IsConsoleArg) || dryRun || status);
+            var converter = new SaveConverter(config, logger, dryRun);
 
-            if (args.Any(a => a.Equals("--once", StringComparison.OrdinalIgnoreCase)))
+            try
             {
-                logger.Info("Running one reconciliation pass.");
-                return converter.ReconcileAll("manual once") ? 0 : 1;
-            }
-
-            if (Environment.UserInteractive || args.Any(IsConsoleArg))
-            {
-                logger.Info("Starting in console mode. Press Ctrl+C to stop.");
-                using (var runner = new ConverterRunner(converter, logger))
+                if (status)
                 {
-                    runner.Start();
-                    var stop = new ManualResetEvent(false);
-                    Console.CancelKeyPress += (sender, eventArgs) =>
-                    {
-                        eventArgs.Cancel = true;
-                        stop.Set();
-                    };
-                    stop.WaitOne();
-                    runner.Stop();
+                    converter.WriteStatus();
+                    return 0;
                 }
 
+                if (args.Any(IsOnceArg) || dryRun)
+                {
+                    logger.Info(dryRun ? "Running one dry-run reconciliation pass." : "Running one reconciliation pass.");
+                    var success = converter.ReconcileAll(dryRun ? "manual dry run" : "manual once");
+                    converter.FlushSyncthingScans();
+                    return success ? 0 : 1;
+                }
+
+                if (Environment.UserInteractive || args.Any(IsConsoleArg))
+                {
+                    logger.Info("Starting in console mode. Press Ctrl+C to stop.");
+                    using (var runner = new ConverterRunner(converter, logger))
+                    {
+                        runner.Start();
+                        var stop = new ManualResetEvent(false);
+                        Console.CancelKeyPress += (sender, eventArgs) =>
+                        {
+                            eventArgs.Cancel = true;
+                            stop.Set();
+                        };
+                        stop.WaitOne();
+                        runner.Stop();
+                    }
+
+                    return 0;
+                }
+
+                ServiceBase.Run(new ConverterService(converter, logger, ServiceName));
                 return 0;
             }
-
-            ServiceBase.Run(new ConverterService(converter, logger, ServiceName));
-            return 0;
+            finally
+            {
+                converter.Dispose();
+            }
         }
 
         private static bool IsConsoleArg(string arg)
         {
             return arg.Equals("--console", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsOnceArg(string arg)
+        {
+            return arg.Equals("--once", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsDryRunArg(string arg)
+        {
+            return arg.Equals("--dry-run", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsStatusArg(string arg)
+        {
+            return arg.Equals("--status", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string GetConfigPath(string[] args, string fallback)
@@ -280,23 +311,71 @@ namespace GBASaveConverter
         }
     }
 
-    internal sealed class SaveConverter
+    internal sealed class SaveConverter : IDisposable
     {
         private readonly Logger logger;
         private readonly SyncthingScanner syncthingScanner;
+        private readonly SaveJournal journal;
+        private readonly object reconcileGate = new object();
+        private readonly bool dryRun;
+        private DateTime lastBackupCleanupUtc = DateTime.MinValue;
+        private bool disposed;
 
         public ConverterConfig Config { get; private set; }
 
-        public SaveConverter(ConverterConfig config, Logger logger)
+        public SaveConverter(ConverterConfig config, Logger logger, bool dryRun)
         {
             Config = config;
             this.logger = logger;
+            this.dryRun = dryRun;
+            journal = new SaveJournal(config.StateFilePath, logger);
             syncthingScanner = new SyncthingScanner(config, logger);
         }
 
         public bool ReconcileAll(string reason)
         {
-            try
+            lock (reconcileGate)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Config.SaveDirectory);
+                    CleanupBackupsIfNeeded();
+
+                    var pairs = Directory.EnumerateFiles(Config.SaveDirectory, "*.*", SearchOption.TopDirectoryOnly)
+                        .Where(SavePair.IsSaveFile)
+                        .Select(SavePair.PairKey)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    logger.Info("Reconciling " + pairs.Count + " save pair(s): " + reason + ".");
+
+                    foreach (var pair in pairs)
+                    {
+                        ReconcilePairCore(pair, reason, null);
+                    }
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    logger.Error("Failed to reconcile save folder.", ex);
+                    return false;
+                }
+            }
+        }
+
+        public void ReconcilePair(string pairKey, string reason, Action<string> markIgnoredWrite)
+        {
+            lock (reconcileGate)
+            {
+                ReconcilePairCore(pairKey, reason, markIgnoredWrite);
+            }
+        }
+
+        public void WriteStatus()
+        {
+            lock (reconcileGate)
             {
                 Directory.CreateDirectory(Config.SaveDirectory);
                 var pairs = Directory.EnumerateFiles(Config.SaveDirectory, "*.*", SearchOption.TopDirectoryOnly)
@@ -306,69 +385,151 @@ namespace GBASaveConverter
                     .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
                     .ToList();
 
-                logger.Info("Reconciling " + pairs.Count + " save pair(s): " + reason + ".");
+                var matched = 0;
+                var missingSav = 0;
+                var missingSrm = 0;
+                var differing = 0;
+                var recordedConflicts = 0;
 
-                foreach (var pair in pairs)
+                foreach (var pairKey in pairs)
                 {
-                    ReconcilePair(pair, reason, null);
+                    var pair = SavePair.FromKey(pairKey);
+                    var savExists = File.Exists(pair.SavPath);
+                    var srmExists = File.Exists(pair.SrmPath);
+
+                    if (savExists && !srmExists)
+                    {
+                        missingSrm++;
+                        continue;
+                    }
+
+                    if (!savExists && srmExists)
+                    {
+                        missingSav++;
+                        continue;
+                    }
+
+                    if (!savExists && !srmExists) continue;
+
+                    var sav = SaveFileSnapshot.FromFile(pair.SavPath);
+                    var srm = SaveFileSnapshot.FromFile(pair.SrmPath);
+                    if (HashEquals(sav.Hash, srm.Hash))
+                    {
+                        matched++;
+                    }
+                    else
+                    {
+                        differing++;
+                        var state = journal.Get(pairKey);
+                        if (state != null && state.IsCurrentConflict(sav, srm))
+                        {
+                            recordedConflicts++;
+                        }
+                    }
                 }
 
-                return true;
-            }
-            catch (Exception ex)
-            {
-                logger.Error("Failed to reconcile save folder.", ex);
-                return false;
+                logger.Info("Status for " + Config.SaveDirectory);
+                logger.Info("Pairs: " + pairs.Count + "; matched: " + matched + "; missing .sav: " + missingSav + "; missing .srm: " + missingSrm + "; differing: " + differing + "; recorded conflicts: " + recordedConflicts + ".");
+                logger.Info("State file: " + Config.StateFilePath);
+                logger.Info("Backup directory: " + Config.BackupDirectory + "; retention days: " + Config.BackupRetentionDays + ".");
+                logger.Info("Syncthing scan hook: " + (Config.SyncthingScanAfterWrite ? "enabled" : "disabled") + ".");
             }
         }
 
-        public void ReconcilePair(string pairKey, string reason, Action<string> markIgnoredWrite)
+        public void FlushSyncthingScans()
+        {
+            syncthingScanner.Flush();
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            syncthingScanner.Dispose();
+            disposed = true;
+        }
+
+        private void ReconcilePairCore(string pairKey, string reason, Action<string> markIgnoredWrite)
         {
             try
             {
                 var pair = SavePair.FromKey(pairKey);
-                var sav = pair.SavPath;
-                var srm = pair.SrmPath;
-                var savExists = File.Exists(sav);
-                var srmExists = File.Exists(srm);
+                var savExists = File.Exists(pair.SavPath);
+                var srmExists = File.Exists(pair.SrmPath);
 
-                if (!savExists && !srmExists) return;
-
-                if (savExists && !IsFileStable(sav))
+                if (!savExists && !srmExists)
                 {
-                    logger.Info("Skipping unstable file for now: " + sav);
+                    if (!dryRun && journal.Remove(pairKey))
+                    {
+                        journal.Save();
+                    }
+
                     return;
                 }
 
-                if (srmExists && !IsFileStable(srm))
+                if (savExists && !IsFileStable(pair.SavPath))
                 {
-                    logger.Info("Skipping unstable file for now: " + srm);
+                    logger.Info("Skipping unstable file for now: " + pair.SavPath);
                     return;
                 }
+
+                if (srmExists && !IsFileStable(pair.SrmPath))
+                {
+                    logger.Info("Skipping unstable file for now: " + pair.SrmPath);
+                    return;
+                }
+
+                var oldState = journal.Get(pairKey);
 
                 if (savExists && !srmExists)
                 {
-                    CopySave(sav, srm, false, reason, markIgnoredWrite);
+                    if (CopySave(pair.SavPath, pair.SrmPath, false, reason, markIgnoredWrite))
+                    {
+                        SaveCleanState(pairKey, ".sav", oldState);
+                    }
+
                     return;
                 }
 
                 if (!savExists && srmExists)
                 {
-                    CopySave(srm, sav, false, reason, markIgnoredWrite);
+                    if (CopySave(pair.SrmPath, pair.SavPath, false, reason, markIgnoredWrite))
+                    {
+                        SaveCleanState(pairKey, ".srm", oldState);
+                    }
+
                     return;
                 }
 
-                if (FilesMatch(sav, srm))
+                var savSnapshot = SaveFileSnapshot.FromFile(pair.SavPath);
+                var srmSnapshot = SaveFileSnapshot.FromFile(pair.SrmPath);
+
+                if (HashEquals(savSnapshot.Hash, srmSnapshot.Hash))
                 {
+                    SaveCleanState(pairKey, savSnapshot, srmSnapshot, "", oldState);
                     return;
                 }
 
-                var savInfo = new FileInfo(sav);
-                var srmInfo = new FileInfo(srm);
-                var source = savInfo.LastWriteTimeUtc >= srmInfo.LastWriteTimeUtc ? sav : srm;
-                var target = source.Equals(sav, StringComparison.OrdinalIgnoreCase) ? srm : sav;
+                var decision = ChooseSource(savSnapshot, srmSnapshot, oldState);
+                if (decision.Type == ReconcileDecisionType.ExistingConflict)
+                {
+                    logger.Warn("Conflict still unresolved for " + Path.GetFileName(pairKey) + ": " + decision.Reason);
+                    return;
+                }
 
-                CopySave(source, target, true, reason, markIgnoredWrite);
+                if (decision.Type == ReconcileDecisionType.Conflict)
+                {
+                    RecordConflict(pairKey, savSnapshot, srmSnapshot, oldState, decision.Reason);
+                    return;
+                }
+
+                var source = decision.Type == ReconcileDecisionType.CopySavToSrm ? pair.SavPath : pair.SrmPath;
+                var target = decision.Type == ReconcileDecisionType.CopySavToSrm ? pair.SrmPath : pair.SavPath;
+                var sourceExtension = decision.Type == ReconcileDecisionType.CopySavToSrm ? ".sav" : ".srm";
+
+                if (CopySave(source, target, true, reason + "; " + decision.Reason, markIgnoredWrite))
+                {
+                    SaveCleanState(pairKey, sourceExtension, oldState);
+                }
             }
             catch (IOException ex)
             {
@@ -384,8 +545,79 @@ namespace GBASaveConverter
             }
         }
 
+        private ReconcileDecision ChooseSource(SaveFileSnapshot sav, SaveFileSnapshot srm, PairState oldState)
+        {
+            if (oldState != null)
+            {
+                if (oldState.IsCurrentConflict(sav, srm))
+                {
+                    return ReconcileDecision.ExistingConflict("both sides still differ exactly as previously recorded");
+                }
+
+                var savChanged = oldState.Sav == null || !HashEquals(sav.Hash, oldState.Sav.Hash);
+                var srmChanged = oldState.Srm == null || !HashEquals(srm.Hash, oldState.Srm.Hash);
+                var savMatchesLastSync = !string.IsNullOrEmpty(oldState.SyncedHash) && HashEquals(sav.Hash, oldState.SyncedHash);
+                var srmMatchesLastSync = !string.IsNullOrEmpty(oldState.SyncedHash) && HashEquals(srm.Hash, oldState.SyncedHash);
+                var savIsKnownOlder = oldState.IsKnownOlderHash(sav.Hash);
+                var srmIsKnownOlder = oldState.IsKnownOlderHash(srm.Hash);
+
+                if (savIsKnownOlder && srmMatchesLastSync)
+                {
+                    return ReconcileDecision.CopySrmToSav("the .sav content is an older known save touched after the last sync");
+                }
+
+                if (srmIsKnownOlder && savMatchesLastSync)
+                {
+                    return ReconcileDecision.CopySavToSrm("the .srm content is an older known save touched after the last sync");
+                }
+
+                if (savChanged && !srmChanged)
+                {
+                    if (savIsKnownOlder)
+                    {
+                        return ReconcileDecision.CopySrmToSav("the changed .sav content matches older journal history");
+                    }
+
+                    return ReconcileDecision.CopySavToSrm("only .sav changed since the last journal state");
+                }
+
+                if (!savChanged && srmChanged)
+                {
+                    if (srmIsKnownOlder)
+                    {
+                        return ReconcileDecision.CopySavToSrm("the changed .srm content matches older journal history");
+                    }
+
+                    return ReconcileDecision.CopySrmToSav("only .srm changed since the last journal state");
+                }
+
+                if (savMatchesLastSync && !srmMatchesLastSync)
+                {
+                    return ReconcileDecision.CopySrmToSav(".sav still matches the last synced content");
+                }
+
+                if (srmMatchesLastSync && !savMatchesLastSync)
+                {
+                    return ReconcileDecision.CopySavToSrm(".srm still matches the last synced content");
+                }
+
+                if (savChanged && srmChanged)
+                {
+                    return ReconcileDecision.Conflict("both .sav and .srm changed differently since the last journal state");
+                }
+
+                return ReconcileDecision.Conflict("both files differ, but neither side changed since the last journal state");
+            }
+
+            return sav.LastWriteUtc >= srm.LastWriteUtc
+                ? ReconcileDecision.CopySavToSrm("no journal yet; newest modified time wins")
+                : ReconcileDecision.CopySrmToSav("no journal yet; newest modified time wins");
+        }
+
         private bool IsFileStable(string path)
         {
+            if (!File.Exists(path)) return false;
+
             var first = new FileInfo(path);
             var length = first.Length;
             var writeTime = first.LastWriteTimeUtc;
@@ -396,8 +628,14 @@ namespace GBASaveConverter
             return second.Exists && second.Length == length && second.LastWriteTimeUtc == writeTime;
         }
 
-        private void CopySave(string source, string target, bool targetExists, string reason, Action<string> markIgnoredWrite)
+        private bool CopySave(string source, string target, bool targetExists, string reason, Action<string> markIgnoredWrite)
         {
+            if (dryRun)
+            {
+                logger.Info("[dry-run] Would sync " + Path.GetFileName(source) + " -> " + Path.GetFileName(target) + " (" + reason + ").");
+                return false;
+            }
+
             Directory.CreateDirectory(Path.GetDirectoryName(target));
             if (markIgnoredWrite != null)
             {
@@ -412,8 +650,59 @@ namespace GBASaveConverter
             File.Copy(source, target, true);
             File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(source));
             logger.Info("Synced " + Path.GetFileName(source) + " -> " + Path.GetFileName(target) + " (" + reason + ").");
-            syncthingScanner.ScanFile(source);
-            syncthingScanner.ScanFile(target);
+            syncthingScanner.QueueFile(source);
+            syncthingScanner.QueueFile(target);
+            return true;
+        }
+
+        private void SaveCleanState(string pairKey, string sourceExtension, PairState oldState)
+        {
+            var pair = SavePair.FromKey(pairKey);
+            SaveCleanState(
+                pairKey,
+                SaveFileSnapshot.FromFile(pair.SavPath),
+                SaveFileSnapshot.FromFile(pair.SrmPath),
+                sourceExtension,
+                oldState);
+        }
+
+        private void SaveCleanState(string pairKey, SaveFileSnapshot sav, SaveFileSnapshot srm, string sourceExtension, PairState oldState)
+        {
+            if (dryRun) return;
+
+            var syncedHash = sav.Exists && srm.Exists && HashEquals(sav.Hash, srm.Hash) ? sav.Hash : "";
+            var state = PairState.CreateClean(pairKey, sav, srm, syncedHash, sourceExtension, oldState);
+            journal.Set(state);
+            journal.Save();
+        }
+
+        private void RecordConflict(string pairKey, SaveFileSnapshot sav, SaveFileSnapshot srm, PairState oldState, string reason)
+        {
+            var pairName = Path.GetFileName(pairKey);
+            var fingerprint = PairState.BuildConflictFingerprint(sav, srm);
+            var alreadyRecorded = oldState != null && string.Equals(oldState.ConflictFingerprint, fingerprint, StringComparison.Ordinal);
+
+            if (alreadyRecorded)
+            {
+                logger.Warn("Conflict still unresolved for " + pairName + ": " + reason);
+                return;
+            }
+
+            if (dryRun)
+            {
+                logger.Warn("[dry-run] Would record conflict for " + pairName + ": " + reason);
+                return;
+            }
+
+            if (Config.BackupBeforeOverwrite)
+            {
+                BackupFile(sav.Path);
+                BackupFile(srm.Path);
+            }
+
+            logger.Warn("Conflict detected for " + pairName + ": " + reason + ". Both files were left untouched.");
+            journal.Set(PairState.CreateConflict(pairKey, sav, srm, reason, oldState));
+            journal.Save();
         }
 
         private void BackupFile(string path)
@@ -428,26 +717,161 @@ namespace GBASaveConverter
             logger.Info("Backed up " + Path.GetFileName(path) + " to " + backupPath + ".");
         }
 
-        private static bool FilesMatch(string firstPath, string secondPath)
+        private void CleanupBackupsIfNeeded()
         {
-            var first = new FileInfo(firstPath);
-            var second = new FileInfo(secondPath);
-            if (first.Length != second.Length) return false;
+            if (dryRun || Config.BackupRetentionDays <= 0) return;
+            if (DateTime.UtcNow.Subtract(lastBackupCleanupUtc) < TimeSpan.FromHours(1)) return;
+            lastBackupCleanupUtc = DateTime.UtcNow;
 
-            using (var sha = SHA256.Create())
+            if (!Directory.Exists(Config.BackupDirectory)) return;
+
+            var cutoff = DateTime.UtcNow.AddDays(-Config.BackupRetentionDays);
+            var deleted = 0;
+            foreach (var backup in Directory.EnumerateFiles(Config.BackupDirectory, "*.bak", SearchOption.AllDirectories))
             {
-                var firstHash = HashFile(sha, firstPath);
-                var secondHash = HashFile(sha, secondPath);
-                return firstHash.SequenceEqual(secondHash);
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(backup) < cutoff)
+                    {
+                        File.Delete(backup);
+                        deleted++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.Error("Failed to delete expired backup: " + backup, ex);
+                }
+            }
+
+            if (deleted > 0)
+            {
+                logger.Info("Deleted " + deleted + " expired backup file(s).");
             }
         }
 
-        private static byte[] HashFile(HashAlgorithm algorithm, string path)
+        private static bool HashEquals(string first, string second)
         {
+            return string.Equals(first ?? "", second ?? "", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    internal enum ReconcileDecisionType
+    {
+        CopySavToSrm,
+        CopySrmToSav,
+        Conflict,
+        ExistingConflict
+    }
+
+    internal sealed class ReconcileDecision
+    {
+        private ReconcileDecision(ReconcileDecisionType type, string reason)
+        {
+            Type = type;
+            Reason = reason;
+        }
+
+        public ReconcileDecisionType Type { get; private set; }
+        public string Reason { get; private set; }
+
+        public static ReconcileDecision CopySavToSrm(string reason)
+        {
+            return new ReconcileDecision(ReconcileDecisionType.CopySavToSrm, reason);
+        }
+
+        public static ReconcileDecision CopySrmToSav(string reason)
+        {
+            return new ReconcileDecision(ReconcileDecisionType.CopySrmToSav, reason);
+        }
+
+        public static ReconcileDecision Conflict(string reason)
+        {
+            return new ReconcileDecision(ReconcileDecisionType.Conflict, reason);
+        }
+
+        public static ReconcileDecision ExistingConflict(string reason)
+        {
+            return new ReconcileDecision(ReconcileDecisionType.ExistingConflict, reason);
+        }
+    }
+
+    internal sealed class SaveFileSnapshot
+    {
+        private SaveFileSnapshot()
+        {
+        }
+
+        public string Path { get; private set; }
+        public bool Exists { get; private set; }
+        public long Length { get; private set; }
+        public long LastWriteUtcTicks { get; private set; }
+        public string Hash { get; private set; }
+
+        public DateTime LastWriteUtc
+        {
+            get { return new DateTime(LastWriteUtcTicks, DateTimeKind.Utc); }
+        }
+
+        public static SaveFileSnapshot Missing(string path)
+        {
+            return new SaveFileSnapshot
+            {
+                Path = path,
+                Exists = false,
+                Length = 0,
+                LastWriteUtcTicks = 0,
+                Hash = "",
+            };
+        }
+
+        public static SaveFileSnapshot FromFile(string path)
+        {
+            if (!File.Exists(path))
+            {
+                return Missing(path);
+            }
+
+            var info = new FileInfo(path);
+            return new SaveFileSnapshot
+            {
+                Path = path,
+                Exists = true,
+                Length = info.Length,
+                LastWriteUtcTicks = info.LastWriteTimeUtc.Ticks,
+                Hash = HashFile(path),
+            };
+        }
+
+        public static SaveFileSnapshot FromState(long length, long lastWriteUtcTicks, string hash)
+        {
+            return new SaveFileSnapshot
+            {
+                Path = "",
+                Exists = true,
+                Length = length,
+                LastWriteUtcTicks = lastWriteUtcTicks,
+                Hash = hash ?? "",
+            };
+        }
+
+        private static string HashFile(string path)
+        {
+            using (var sha = SHA256.Create())
             using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
-                return algorithm.ComputeHash(stream);
+                return BytesToHex(sha.ComputeHash(stream));
             }
+        }
+
+        private static string BytesToHex(byte[] bytes)
+        {
+            var builder = new StringBuilder(bytes.Length * 2);
+            foreach (var value in bytes)
+            {
+                builder.Append(value.ToString("x2"));
+            }
+
+            return builder.ToString();
         }
     }
 
@@ -486,18 +910,282 @@ namespace GBASaveConverter
         }
     }
 
+    internal sealed class SaveJournal
+    {
+        private readonly string path;
+        private readonly Logger logger;
+        private readonly Dictionary<string, PairState> states = new Dictionary<string, PairState>(StringComparer.OrdinalIgnoreCase);
+
+        public SaveJournal(string path, Logger logger)
+        {
+            this.path = path;
+            this.logger = logger;
+            Load();
+        }
+
+        public PairState Get(string pairKey)
+        {
+            PairState state;
+            return states.TryGetValue(pairKey, out state) ? state : null;
+        }
+
+        public void Set(PairState state)
+        {
+            states[state.PairKey] = state;
+        }
+
+        public bool Remove(string pairKey)
+        {
+            return states.Remove(pairKey);
+        }
+
+        public void Save()
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path));
+            var tempPath = path + ".tmp";
+            var lines = new List<string>
+            {
+                "# GBASaveConverter state v1",
+            };
+
+            foreach (var state in states.Values.OrderBy(item => item.PairKey, StringComparer.OrdinalIgnoreCase))
+            {
+                lines.Add(state.ToLine());
+            }
+
+            File.WriteAllLines(tempPath, lines.ToArray(), Encoding.UTF8);
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+
+            File.Move(tempPath, path);
+        }
+
+        private void Load()
+        {
+            if (!File.Exists(path)) return;
+
+            foreach (var line in File.ReadAllLines(path))
+            {
+                if (line.Trim().Length == 0 || line.StartsWith("#")) continue;
+
+                try
+                {
+                    var state = PairState.FromLine(line);
+                    if (state != null)
+                    {
+                        states[state.PairKey] = state;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.Error("Skipped invalid journal line in " + path + ".", ex);
+                }
+            }
+        }
+    }
+
+    internal sealed class PairState
+    {
+        private const int MaxKnownHashes = 20;
+
+        public string PairKey { get; private set; }
+        public SaveFileSnapshot Sav { get; private set; }
+        public SaveFileSnapshot Srm { get; private set; }
+        public string SyncedHash { get; private set; }
+        public string LastSourceExtension { get; private set; }
+        public string ConflictFingerprint { get; private set; }
+        public string ConflictReason { get; private set; }
+        public DateTime UpdatedUtc { get; private set; }
+        public List<string> KnownHashes { get; private set; }
+
+        public bool IsConflict
+        {
+            get { return !string.IsNullOrEmpty(ConflictFingerprint); }
+        }
+
+        public bool IsCurrentConflict(SaveFileSnapshot sav, SaveFileSnapshot srm)
+        {
+            return IsConflict && string.Equals(ConflictFingerprint, BuildConflictFingerprint(sav, srm), StringComparison.Ordinal);
+        }
+
+        public bool IsKnownOlderHash(string hash)
+        {
+            if (string.IsNullOrEmpty(hash)) return false;
+            if (string.Equals(hash, SyncedHash, StringComparison.OrdinalIgnoreCase)) return false;
+            return KnownHashes.Any(item => string.Equals(item, hash, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public static PairState CreateClean(
+            string pairKey,
+            SaveFileSnapshot sav,
+            SaveFileSnapshot srm,
+            string syncedHash,
+            string sourceExtension,
+            PairState oldState)
+        {
+            return new PairState
+            {
+                PairKey = pairKey,
+                Sav = sav,
+                Srm = srm,
+                SyncedHash = syncedHash ?? "",
+                LastSourceExtension = sourceExtension ?? "",
+                ConflictFingerprint = "",
+                ConflictReason = "",
+                UpdatedUtc = DateTime.UtcNow,
+                KnownHashes = BuildKnownHashes(syncedHash, oldState),
+            };
+        }
+
+        public static PairState CreateConflict(
+            string pairKey,
+            SaveFileSnapshot sav,
+            SaveFileSnapshot srm,
+            string reason,
+            PairState oldState)
+        {
+            var syncedHash = oldState == null ? "" : oldState.SyncedHash;
+            return new PairState
+            {
+                PairKey = pairKey,
+                Sav = sav,
+                Srm = srm,
+                SyncedHash = syncedHash,
+                LastSourceExtension = oldState == null ? "" : oldState.LastSourceExtension,
+                ConflictFingerprint = BuildConflictFingerprint(sav, srm),
+                ConflictReason = reason ?? "",
+                UpdatedUtc = DateTime.UtcNow,
+                KnownHashes = BuildKnownHashes(syncedHash, oldState),
+            };
+        }
+
+        public static string BuildConflictFingerprint(SaveFileSnapshot sav, SaveFileSnapshot srm)
+        {
+            return (sav.Hash ?? "") + "|" + (srm.Hash ?? "");
+        }
+
+        public string ToLine()
+        {
+            var fields = new[]
+            {
+                Encode(PairKey),
+                SnapshotToFields(Sav),
+                SnapshotToFields(Srm),
+                SyncedHash ?? "",
+                LastSourceExtension ?? "",
+                ConflictFingerprint ?? "",
+                Encode(ConflictReason ?? ""),
+                UpdatedUtc.Ticks.ToString(),
+                string.Join(",", KnownHashes.ToArray()),
+            };
+
+            return string.Join("\t", fields);
+        }
+
+        public static PairState FromLine(string line)
+        {
+            var parts = line.Split('\t');
+            if (parts.Length < 9) return null;
+
+            return new PairState
+            {
+                PairKey = Decode(parts[0]),
+                Sav = SnapshotFromFields(parts[1]),
+                Srm = SnapshotFromFields(parts[2]),
+                SyncedHash = parts[3],
+                LastSourceExtension = parts[4],
+                ConflictFingerprint = parts[5],
+                ConflictReason = Decode(parts[6]),
+                UpdatedUtc = new DateTime(ParseLong(parts[7]), DateTimeKind.Utc),
+                KnownHashes = parts[8].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Distinct(StringComparer.OrdinalIgnoreCase).Take(MaxKnownHashes).ToList(),
+            };
+        }
+
+        private static List<string> BuildKnownHashes(string syncedHash, PairState oldState)
+        {
+            var hashes = new List<string>();
+            AddHash(hashes, syncedHash);
+
+            if (oldState != null)
+            {
+                AddHash(hashes, oldState.SyncedHash);
+                if (oldState.KnownHashes != null)
+                {
+                    foreach (var hash in oldState.KnownHashes)
+                    {
+                        AddHash(hashes, hash);
+                    }
+                }
+            }
+
+            return hashes.Take(MaxKnownHashes).ToList();
+        }
+
+        private static void AddHash(List<string> hashes, string hash)
+        {
+            if (string.IsNullOrEmpty(hash)) return;
+            if (hashes.Any(item => string.Equals(item, hash, StringComparison.OrdinalIgnoreCase))) return;
+            hashes.Add(hash);
+        }
+
+        private static string SnapshotToFields(SaveFileSnapshot snapshot)
+        {
+            if (snapshot == null || !snapshot.Exists)
+            {
+                return "0|0|0|";
+            }
+
+            return "1|" + snapshot.Length + "|" + snapshot.LastWriteUtcTicks + "|" + (snapshot.Hash ?? "");
+        }
+
+        private static SaveFileSnapshot SnapshotFromFields(string value)
+        {
+            var parts = value.Split('|');
+            if (parts.Length < 4 || parts[0] != "1")
+            {
+                return SaveFileSnapshot.Missing("");
+            }
+
+            return SaveFileSnapshot.FromState(ParseLong(parts[1]), ParseLong(parts[2]), parts[3]);
+        }
+
+        private static string Encode(string value)
+        {
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(value ?? ""));
+        }
+
+        private static string Decode(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            return Encoding.UTF8.GetString(Convert.FromBase64String(value));
+        }
+
+        private static long ParseLong(string value)
+        {
+            long parsed;
+            return long.TryParse(value, out parsed) ? parsed : 0;
+        }
+    }
+
     internal sealed class ConverterConfig
     {
         public string SaveDirectory { get; private set; }
         public string LogDirectory { get; private set; }
         public string BackupDirectory { get; private set; }
+        public string StateDirectory { get; private set; }
+        public string StateFilePath { get; private set; }
         public bool BackupBeforeOverwrite { get; private set; }
+        public int BackupRetentionDays { get; private set; }
         public bool LogToConsole { get; private set; }
         public bool SyncthingScanAfterWrite { get; private set; }
         public string SyncthingApiBaseUrl { get; private set; }
         public string SyncthingApiKey { get; private set; }
         public string SyncthingFolderId { get; private set; }
         public string SyncthingScanSubdirectory { get; private set; }
+        public TimeSpan SyncthingScanDebounceInterval { get; private set; }
+        public TimeSpan SyncthingRequestTimeout { get; private set; }
         public TimeSpan DebounceInterval { get; private set; }
         public TimeSpan FullScanInterval { get; private set; }
         public TimeSpan IgnoreOwnWritesInterval { get; private set; }
@@ -514,18 +1202,24 @@ namespace GBASaveConverter
                 .Where(parts => parts.Length == 2)
                 .ToDictionary(parts => parts[0].Trim(), parts => parts[1].Trim(), StringComparer.OrdinalIgnoreCase);
 
+            var stateDirectory = ResolvePath(appDirectory, Get(values, "StateDirectory", "state"));
             return new ConverterConfig
             {
                 SaveDirectory = Get(values, "SaveDirectory", @"C:\RetroArch\saves\mGBA"),
                 LogDirectory = ResolvePath(appDirectory, Get(values, "LogDirectory", "logs")),
                 BackupDirectory = ResolvePath(appDirectory, Get(values, "BackupDirectory", "backups")),
+                StateDirectory = stateDirectory,
+                StateFilePath = Path.Combine(stateDirectory, "pairs.tsv"),
                 BackupBeforeOverwrite = GetBool(values, "BackupBeforeOverwrite", true),
+                BackupRetentionDays = GetInt(values, "BackupRetentionDays", 0, 0, 3650),
                 LogToConsole = GetBool(values, "LogToConsole", true),
                 SyncthingScanAfterWrite = GetBool(values, "SyncthingScanAfterWrite", false),
                 SyncthingApiBaseUrl = Get(values, "SyncthingApiBaseUrl", "http://127.0.0.1:8384/rest"),
                 SyncthingApiKey = Get(values, "SyncthingApiKey", ""),
                 SyncthingFolderId = Get(values, "SyncthingFolderId", ""),
                 SyncthingScanSubdirectory = Get(values, "SyncthingScanSubdirectory", ""),
+                SyncthingScanDebounceInterval = TimeSpan.FromSeconds(GetInt(values, "SyncthingScanDebounceSeconds", 2, 0, 300)),
+                SyncthingRequestTimeout = TimeSpan.FromSeconds(GetInt(values, "SyncthingRequestTimeoutSeconds", 5, 1, 60)),
                 DebounceInterval = TimeSpan.FromSeconds(GetInt(values, "DebounceSeconds", 5, 1, 120)),
                 FullScanInterval = TimeSpan.FromMinutes(GetInt(values, "FullScanMinutes", 10, 1, 1440)),
                 IgnoreOwnWritesInterval = TimeSpan.FromSeconds(GetInt(values, "IgnoreOwnWritesSeconds", 10, 1, 300)),
@@ -544,12 +1238,16 @@ namespace GBASaveConverter
 SaveDirectory=C:\RetroArch\saves\mGBA
 LogDirectory=logs
 BackupDirectory=backups
+StateDirectory=state
 BackupBeforeOverwrite=true
+BackupRetentionDays=0
 SyncthingScanAfterWrite=false
 SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
 SyncthingApiKey=
 SyncthingFolderId=
 SyncthingScanSubdirectory=
+SyncthingScanDebounceSeconds=2
+SyncthingRequestTimeoutSeconds=5
 DebounceSeconds=5
 FullScanMinutes=10
 IgnoreOwnWritesSeconds=10
@@ -587,26 +1285,113 @@ LogToConsole=true
         }
     }
 
-    internal sealed class SyncthingScanner
+    internal sealed class SyncthingScanner : IDisposable
     {
         private readonly ConverterConfig config;
         private readonly Logger logger;
+        private readonly object gate = new object();
+        private readonly Dictionary<string, DateTime> pendingPaths = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly Timer timer;
+        private bool disposed;
+        private int scanning;
 
         public SyncthingScanner(ConverterConfig config, Logger logger)
         {
             this.config = config;
             this.logger = logger;
+            timer = new Timer(OnTimer, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         }
 
-        public void ScanFile(string path)
+        public void QueueFile(string path)
+        {
+            if (!config.SyncthingScanAfterWrite) return;
+
+            lock (gate)
+            {
+                pendingPaths[path] = DateTime.UtcNow.Add(config.SyncthingScanDebounceInterval);
+            }
+        }
+
+        public void Flush()
+        {
+            if (Interlocked.Exchange(ref scanning, 1) == 1) return;
+
+            try
+            {
+                List<string> paths;
+                lock (gate)
+                {
+                    paths = pendingPaths.Keys.ToList();
+                    pendingPaths.Clear();
+                }
+
+                ScanPaths(paths);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref scanning, 0);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (disposed) return;
+            Flush();
+            timer.Dispose();
+            disposed = true;
+        }
+
+        private void OnTimer(object state)
+        {
+            if (Interlocked.Exchange(ref scanning, 1) == 1) return;
+
+            try
+            {
+                List<string> duePaths;
+                var now = DateTime.UtcNow;
+
+                lock (gate)
+                {
+                    duePaths = pendingPaths
+                        .Where(item => item.Value <= now)
+                        .Select(item => item.Key)
+                        .ToList();
+
+                    foreach (var path in duePaths)
+                    {
+                        pendingPaths.Remove(path);
+                    }
+                }
+
+                ScanPaths(duePaths);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref scanning, 0);
+            }
+        }
+
+        private void ScanPaths(IEnumerable<string> paths)
         {
             if (!config.SyncthingScanAfterWrite) return;
             if (string.IsNullOrWhiteSpace(config.SyncthingApiKey) || string.IsNullOrWhiteSpace(config.SyncthingFolderId))
             {
-                logger.Info("Syncthing scan is enabled but SyncthingApiKey or SyncthingFolderId is missing.");
+                if (paths.Any())
+                {
+                    logger.Info("Syncthing scan is enabled but SyncthingApiKey or SyncthingFolderId is missing.");
+                }
+
                 return;
             }
 
+            foreach (var path in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                ScanFile(path);
+            }
+        }
+
+        private void ScanFile(string path)
+        {
             try
             {
                 var subPath = BuildSyncthingSubPath(path);
@@ -616,8 +1401,8 @@ LogToConsole=true
 
                 var request = (HttpWebRequest)WebRequest.Create(url);
                 request.Method = "POST";
-                request.Timeout = 10000;
-                request.ReadWriteTimeout = 10000;
+                request.Timeout = (int)config.SyncthingRequestTimeout.TotalMilliseconds;
+                request.ReadWriteTimeout = (int)config.SyncthingRequestTimeout.TotalMilliseconds;
                 request.Headers["X-API-Key"] = config.SyncthingApiKey;
                 request.ContentLength = 0;
 
@@ -634,13 +1419,25 @@ LogToConsole=true
 
         private string BuildSyncthingSubPath(string path)
         {
-            var fileName = Path.GetFileName(path);
+            var relativePath = GetPathRelativeToSaveDirectory(path).Replace('\\', '/');
             var subdirectory = (config.SyncthingScanSubdirectory ?? string.Empty)
                 .Trim()
                 .Trim('/', '\\')
                 .Replace('\\', '/');
 
-            return subdirectory.Length == 0 ? fileName : subdirectory + "/" + fileName;
+            return subdirectory.Length == 0 ? relativePath : subdirectory + "/" + relativePath;
+        }
+
+        private string GetPathRelativeToSaveDirectory(string path)
+        {
+            var root = Path.GetFullPath(config.SaveDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var fullPath = Path.GetFullPath(path);
+            if (fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            {
+                return fullPath.Substring(root.Length);
+            }
+
+            return Path.GetFileName(path);
         }
     }
 
@@ -660,6 +1457,11 @@ LogToConsole=true
         public void Info(string message)
         {
             Write("INFO", message, null);
+        }
+
+        public void Warn(string message)
+        {
+            Write("WARN", message, null);
         }
 
         public void Error(string message, Exception exception)

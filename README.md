@@ -9,7 +9,7 @@ Game Name.srm
 Game Name.sav
 ```
 
-When one side changes, the service waits briefly, compares the two files, and copies the newest version to the other extension.
+When one side changes, the service waits briefly, compares the two files, and uses a small state journal to decide which side really changed. If both sides changed differently, it records a conflict and leaves both files untouched.
 
 This was built for a Syncthing setup where RetroArch devices and an Android standalone emulator share the same save folder. It has only been tested with Pizza Boy GBA as the standalone Android emulator.
 
@@ -17,13 +17,15 @@ This was built for a Syncthing setup where RetroArch devices and an Android stan
 
 - Watches one folder for `.srm` and `.sav` files.
 - Creates the missing twin when only one extension exists.
-- Syncs `.srm` to `.sav` or `.sav` to `.srm`, depending on which file is newer.
+- Syncs `.srm` to `.sav` or `.sav` to `.srm`, depending on journal history and file hashes.
 - Compares file hashes before copying, so identical pairs are left alone.
+- Tracks recent known save hashes in `state\pairs.tsv` to avoid old saves winning just because they were touched later.
+- Records true conflicts instead of guessing when both sides changed differently.
 - Debounces file events before syncing so it does not copy half-written saves.
 - Ignores its own recent writes to avoid event loops.
 - Runs a startup reconciliation scan and periodic safety scans.
 - Backs up overwritten files before replacing them.
-- Optionally calls Syncthing's local API after writes so Docker-hosted Syncthing notices converted files immediately.
+- Optionally queues debounced Syncthing local API scans after writes so Docker-hosted Syncthing notices converted files without blocking save conversion.
 - Runs as an automatic Windows service.
 
 ## Default Layout
@@ -51,11 +53,14 @@ GBASaveConverter is intentionally conservative:
 - It checks that the file appears stable before reading it.
 - It hashes both files before copying.
 - It only overwrites when the contents differ.
-- If both files exist and differ, newest modified time wins.
+- If only one side changed since the last journal state, that side wins.
+- If a file is touched later but its hash matches older journal history, it is treated as stale and does not overwrite the current save.
+- If both files changed differently, both are backed up and left untouched for manual review.
+- If there is no journal history yet, newest modified time wins as the fallback.
 - Before overwriting an existing file, it writes a timestamped backup under `backups\YYYYMMDD`.
 - Files with `.sync-conflict-` in the name are ignored so Syncthing conflict copies are not treated as normal save pairs.
 
-The main edge case is playing the same game on two devices before Syncthing has finished syncing both sides. In that case, newest modified time wins, and the older overwritten target is backed up.
+The main edge case is playing the same game on two devices before Syncthing has finished syncing both sides. In that case, GBASaveConverter records a conflict if both sides changed differently. The app does not merge save data.
 
 ## Requirements
 
@@ -95,12 +100,16 @@ Edit `GBASaveConverter.ini` as needed:
 SaveDirectory=C:\RetroArch\saves\mGBA
 LogDirectory=logs
 BackupDirectory=backups
+StateDirectory=state
 BackupBeforeOverwrite=true
+BackupRetentionDays=0
 SyncthingScanAfterWrite=false
 SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
 SyncthingApiKey=
 SyncthingFolderId=
 SyncthingScanSubdirectory=
+SyncthingScanDebounceSeconds=2
+SyncthingRequestTimeoutSeconds=5
 DebounceSeconds=5
 FullScanMinutes=10
 IgnoreOwnWritesSeconds=10
@@ -112,7 +121,7 @@ LogToConsole=true
 
 If Syncthing runs in Docker on Windows, filesystem watcher events from host bind mounts may not reliably reach the Syncthing container. In that setup, Syncthing might not notice that GBASaveConverter created or updated a paired save until a periodic rescan.
 
-Enable the scan hook to request an immediate Syncthing scan for the source and converted target after each conversion:
+Enable the scan hook to queue Syncthing scans for the source and converted target after each conversion:
 
 ```ini
 SyncthingScanAfterWrite=true
@@ -120,6 +129,8 @@ SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
 SyncthingApiKey=your-local-syncthing-api-key
 SyncthingFolderId=your-syncthing-folder-id
 SyncthingScanSubdirectory=mGBA
+SyncthingScanDebounceSeconds=2
+SyncthingRequestTimeoutSeconds=5
 ```
 
 For a Syncthing folder rooted at `C:\RetroArch\saves` and saves in `C:\RetroArch\saves\mGBA`, use `SyncthingScanSubdirectory=mGBA`.
@@ -133,6 +144,28 @@ Useful before installing the service:
 ```powershell
 .\scripts\Run-Once.ps1
 ```
+
+Preview what would happen without writing files:
+
+```powershell
+.\scripts\Run-Once.ps1 --dry-run
+```
+
+Show a quick folder summary:
+
+```powershell
+.\scripts\Run-Once.ps1 --status
+```
+
+## Test
+
+Run the disposable test harness:
+
+```powershell
+.\scripts\Test-GBASaveConverter.ps1
+```
+
+The tests compile to `tmp-test\automated`, use temporary save files, and cover missing twins, stale touched saves, conflict detection, dry-run, and status output.
 
 ## Install As A Windows Service
 
@@ -183,9 +216,12 @@ By default:
 ```text
 logs\GBASaveConverter.log
 backups\YYYYMMDD\*.bak
+state\pairs.tsv
 ```
 
-Logs, backups, local config, and build output are ignored by Git.
+Logs, backups, local state, local config, and build output are ignored by Git.
+
+`BackupRetentionDays=0` keeps backups forever. Set it to a positive number to delete `.bak` files older than that many days during reconciliation.
 
 ## License
 

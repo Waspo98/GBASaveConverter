@@ -3,12 +3,16 @@
 SaveDirectory=C:\RetroArch\saves\mGBA
 LogDirectory=logs
 BackupDirectory=backups
+StateDirectory=state
 BackupBeforeOverwrite=true
+BackupRetentionDays=0
 SyncthingScanAfterWrite=false
 SyncthingApiBaseUrl=http://127.0.0.1:8384/rest
 SyncthingApiKey=
 SyncthingFolderId=
 SyncthingScanSubdirectory=
+SyncthingScanDebounceSeconds=2
+SyncthingRequestTimeoutSeconds=5
 DebounceSeconds=5
 FullScanMinutes=10
 IgnoreOwnWritesSeconds=10

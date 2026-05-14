@@ -9,6 +9,7 @@ obj/
 GBASaveConverter.ini
 logs/
 backups/
+state/
 tmp-test/
 
 # Editor/system files
