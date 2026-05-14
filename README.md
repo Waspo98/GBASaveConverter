@@ -19,7 +19,7 @@ This was built for a Syncthing setup where RetroArch devices and an Android stan
 - Creates the missing twin when only one extension exists.
 - Syncs `.srm` to `.sav` or `.sav` to `.srm`, depending on journal history and file hashes.
 - Compares file hashes before copying, so identical pairs are left alone.
-- Tracks recent known save hashes in `state\pairs.tsv` to avoid old saves winning just because they were touched later.
+- Tracks up to 100 recent known save hashes per game in `state\pairs.tsv` to avoid old saves winning just because they were touched later.
 - Records true conflicts instead of guessing when both sides changed differently.
 - Debounces file events before syncing so it does not copy half-written saves.
 - Ignores its own recent writes to avoid event loops.
@@ -55,6 +55,7 @@ GBASaveConverter is intentionally conservative:
 - It only overwrites when the contents differ.
 - If only one side changed since the last journal state, that side wins.
 - If a file is touched later but its hash matches older journal history, it is treated as stale and does not overwrite the current save.
+- If a one-sided changed file has an unknown hash but an older timestamp than the journal and unchanged twin, it is recorded as a conflict instead of winning.
 - If both files changed differently, both are backed up and left untouched for manual review.
 - If there is no journal history yet, newest modified time wins as the fallback.
 - Before overwriting an existing file, it writes a timestamped backup under `backups\YYYYMMDD`.

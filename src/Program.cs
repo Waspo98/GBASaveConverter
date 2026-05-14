@@ -560,22 +560,29 @@ namespace GBASaveConverter
                 var srmMatchesLastSync = !string.IsNullOrEmpty(oldState.SyncedHash) && HashEquals(srm.Hash, oldState.SyncedHash);
                 var savIsKnownOlder = oldState.IsKnownOlderHash(sav.Hash);
                 var srmIsKnownOlder = oldState.IsKnownOlderHash(srm.Hash);
+                var savIsRejected = oldState.IsRejectedHash(sav.Hash);
+                var srmIsRejected = oldState.IsRejectedHash(srm.Hash);
 
-                if (savIsKnownOlder && srmMatchesLastSync)
+                if ((savIsRejected || savIsKnownOlder) && srmMatchesLastSync)
                 {
                     return ReconcileDecision.CopySrmToSav("the .sav content is an older known save touched after the last sync");
                 }
 
-                if (srmIsKnownOlder && savMatchesLastSync)
+                if ((srmIsRejected || srmIsKnownOlder) && savMatchesLastSync)
                 {
                     return ReconcileDecision.CopySavToSrm("the .srm content is an older known save touched after the last sync");
                 }
 
                 if (savChanged && !srmChanged)
                 {
-                    if (savIsKnownOlder)
+                    if (savIsRejected || savIsKnownOlder)
                     {
                         return ReconcileDecision.CopySrmToSav("the changed .sav content matches older journal history");
+                    }
+
+                    if (!IsPlausibleNewChange(sav, srm, oldState))
+                    {
+                        return ReconcileDecision.Conflict("only .sav changed, but its timestamp is not newer than the journal and unchanged .srm");
                     }
 
                     return ReconcileDecision.CopySavToSrm("only .sav changed since the last journal state");
@@ -583,9 +590,14 @@ namespace GBASaveConverter
 
                 if (!savChanged && srmChanged)
                 {
-                    if (srmIsKnownOlder)
+                    if (srmIsRejected || srmIsKnownOlder)
                     {
                         return ReconcileDecision.CopySavToSrm("the changed .srm content matches older journal history");
+                    }
+
+                    if (!IsPlausibleNewChange(srm, sav, oldState))
+                    {
+                        return ReconcileDecision.Conflict("only .srm changed, but its timestamp is not newer than the journal and unchanged .sav");
                     }
 
                     return ReconcileDecision.CopySrmToSav("only .srm changed since the last journal state");
@@ -612,6 +624,12 @@ namespace GBASaveConverter
             return sav.LastWriteUtc >= srm.LastWriteUtc
                 ? ReconcileDecision.CopySavToSrm("no journal yet; newest modified time wins")
                 : ReconcileDecision.CopySrmToSav("no journal yet; newest modified time wins");
+        }
+
+        private static bool IsPlausibleNewChange(SaveFileSnapshot changed, SaveFileSnapshot unchanged, PairState oldState)
+        {
+            return changed.LastWriteUtcTicks > oldState.UpdatedUtc.Ticks &&
+                changed.LastWriteUtcTicks > unchanged.LastWriteUtcTicks;
         }
 
         private bool IsFileStable(string path)
@@ -988,7 +1006,7 @@ namespace GBASaveConverter
 
     internal sealed class PairState
     {
-        private const int MaxKnownHashes = 20;
+        private const int MaxKnownHashes = 100;
 
         public string PairKey { get; private set; }
         public SaveFileSnapshot Sav { get; private set; }
@@ -999,6 +1017,7 @@ namespace GBASaveConverter
         public string ConflictReason { get; private set; }
         public DateTime UpdatedUtc { get; private set; }
         public List<string> KnownHashes { get; private set; }
+        public List<string> RejectedHashes { get; private set; }
 
         public bool IsConflict
         {
@@ -1014,7 +1033,14 @@ namespace GBASaveConverter
         {
             if (string.IsNullOrEmpty(hash)) return false;
             if (string.Equals(hash, SyncedHash, StringComparison.OrdinalIgnoreCase)) return false;
-            return KnownHashes.Any(item => string.Equals(item, hash, StringComparison.OrdinalIgnoreCase));
+            return KnownHashes != null && KnownHashes.Any(item => string.Equals(item, hash, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public bool IsRejectedHash(string hash)
+        {
+            if (string.IsNullOrEmpty(hash)) return false;
+            if (string.Equals(hash, SyncedHash, StringComparison.OrdinalIgnoreCase)) return false;
+            return RejectedHashes != null && RejectedHashes.Any(item => string.Equals(item, hash, StringComparison.OrdinalIgnoreCase));
         }
 
         public static PairState CreateClean(
@@ -1035,7 +1061,8 @@ namespace GBASaveConverter
                 ConflictFingerprint = "",
                 ConflictReason = "",
                 UpdatedUtc = DateTime.UtcNow,
-                KnownHashes = BuildKnownHashes(syncedHash, oldState),
+                KnownHashes = BuildKnownHashes(syncedHash, sav, srm, oldState),
+                RejectedHashes = BuildRejectedHashes(syncedHash, oldState),
             };
         }
 
@@ -1057,7 +1084,8 @@ namespace GBASaveConverter
                 ConflictFingerprint = BuildConflictFingerprint(sav, srm),
                 ConflictReason = reason ?? "",
                 UpdatedUtc = DateTime.UtcNow,
-                KnownHashes = BuildKnownHashes(syncedHash, oldState),
+                KnownHashes = BuildKnownHashes(syncedHash, sav, srm, oldState),
+                RejectedHashes = BuildRejectedHashes(syncedHash, oldState, sav, srm),
             };
         }
 
@@ -1078,7 +1106,8 @@ namespace GBASaveConverter
                 ConflictFingerprint ?? "",
                 Encode(ConflictReason ?? ""),
                 UpdatedUtc.Ticks.ToString(),
-                string.Join(",", KnownHashes.ToArray()),
+                string.Join(",", (KnownHashes ?? new List<string>()).ToArray()),
+                string.Join(",", (RejectedHashes ?? new List<string>()).ToArray()),
             };
 
             return string.Join("\t", fields);
@@ -1099,18 +1128,23 @@ namespace GBASaveConverter
                 ConflictFingerprint = parts[5],
                 ConflictReason = Decode(parts[6]),
                 UpdatedUtc = new DateTime(ParseLong(parts[7]), DateTimeKind.Utc),
-                KnownHashes = parts[8].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Distinct(StringComparer.OrdinalIgnoreCase).Take(MaxKnownHashes).ToList(),
+                KnownHashes = ParseHashList(parts[8]),
+                RejectedHashes = parts.Length >= 10 ? ParseHashList(parts[9]) : new List<string>(),
             };
         }
 
-        private static List<string> BuildKnownHashes(string syncedHash, PairState oldState)
+        private static List<string> BuildKnownHashes(string syncedHash, SaveFileSnapshot sav, SaveFileSnapshot srm, PairState oldState)
         {
             var hashes = new List<string>();
             AddHash(hashes, syncedHash);
+            AddSnapshotHash(hashes, sav);
+            AddSnapshotHash(hashes, srm);
 
             if (oldState != null)
             {
                 AddHash(hashes, oldState.SyncedHash);
+                AddSnapshotHash(hashes, oldState.Sav);
+                AddSnapshotHash(hashes, oldState.Srm);
                 if (oldState.KnownHashes != null)
                 {
                     foreach (var hash in oldState.KnownHashes)
@@ -1118,6 +1152,33 @@ namespace GBASaveConverter
                         AddHash(hashes, hash);
                     }
                 }
+
+                if (oldState.RejectedHashes != null)
+                {
+                    foreach (var hash in oldState.RejectedHashes)
+                    {
+                        AddHash(hashes, hash);
+                    }
+                }
+            }
+
+            return hashes.Take(MaxKnownHashes).ToList();
+        }
+
+        private static List<string> BuildRejectedHashes(string acceptedHash, PairState oldState, params SaveFileSnapshot[] rejectedSnapshots)
+        {
+            var hashes = new List<string>();
+            if (oldState != null && oldState.RejectedHashes != null)
+            {
+                foreach (var hash in oldState.RejectedHashes)
+                {
+                    AddRejectedHash(hashes, hash, acceptedHash);
+                }
+            }
+
+            foreach (var snapshot in rejectedSnapshots ?? new SaveFileSnapshot[0])
+            {
+                AddRejectedHash(hashes, snapshot == null ? "" : snapshot.Hash, acceptedHash);
             }
 
             return hashes.Take(MaxKnownHashes).ToList();
@@ -1128,6 +1189,28 @@ namespace GBASaveConverter
             if (string.IsNullOrEmpty(hash)) return;
             if (hashes.Any(item => string.Equals(item, hash, StringComparison.OrdinalIgnoreCase))) return;
             hashes.Add(hash);
+        }
+
+        private static void AddRejectedHash(List<string> hashes, string hash, string acceptedHash)
+        {
+            if (string.IsNullOrEmpty(hash)) return;
+            if (!string.IsNullOrEmpty(acceptedHash) && string.Equals(hash, acceptedHash, StringComparison.OrdinalIgnoreCase)) return;
+            AddHash(hashes, hash);
+        }
+
+        private static void AddSnapshotHash(List<string> hashes, SaveFileSnapshot snapshot)
+        {
+            if (snapshot == null || !snapshot.Exists) return;
+            AddHash(hashes, snapshot.Hash);
+        }
+
+        private static List<string> ParseHashList(string value)
+        {
+            return (value ?? "")
+                .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(MaxKnownHashes)
+                .ToList();
         }
 
         private static string SnapshotToFields(SaveFileSnapshot snapshot)

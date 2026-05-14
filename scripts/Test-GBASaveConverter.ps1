@@ -119,7 +119,7 @@ $stale = Join-Path $saveDirectory "StaleTouch"
 Write-Save "$stale.sav" "base"
 Write-Save "$stale.srm" "base"
 Invoke-Converter
-Start-Sleep -Milliseconds 250
+Start-Sleep -Milliseconds 1100
 Write-Save "$stale.srm" "newer"
 Invoke-Converter
 Assert-True ((Read-Save "$stale.sav") -eq "newer") "Expected .srm update to copy to .sav."
@@ -128,6 +128,27 @@ Write-Save "$stale.sav" "base"
 Invoke-Converter
 Assert-True ((Read-Save "$stale.sav") -eq "newer") "Expected known older .sav content to be overwritten by current .srm."
 Assert-True ((Read-Save "$stale.srm") -eq "newer") "Expected current .srm content to survive stale .sav."
+
+# A previously unseen stale file with an older timestamp becomes a conflict instead of winning.
+$unknownStale = Join-Path $saveDirectory "UnknownStale"
+Write-Save "$unknownStale.sav" "current"
+Write-Save "$unknownStale.srm" "current"
+Invoke-Converter
+Write-Save "$unknownStale.sav" "unknown-old"
+(Get-Item -LiteralPath "$unknownStale.sav").LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(-4)
+Invoke-Converter
+Assert-True ((Read-Save "$unknownStale.sav") -eq "unknown-old") "Expected unknown stale .sav to remain for manual review."
+Assert-True ((Read-Save "$unknownStale.srm") -eq "current") "Expected unknown stale .sav not to overwrite current .srm."
+
+# A legitimate newer .sav still copies forward.
+$newSav = Join-Path $saveDirectory "NewSav"
+Write-Save "$newSav.sav" "base"
+Write-Save "$newSav.srm" "base"
+Invoke-Converter
+Start-Sleep -Milliseconds 1100
+Write-Save "$newSav.sav" "pizza-boy-new"
+Invoke-Converter
+Assert-True ((Read-Save "$newSav.srm") -eq "pizza-boy-new") "Expected legitimate newer .sav to copy to .srm."
 
 # If both sides changed differently, neither side is overwritten.
 $conflict = Join-Path $saveDirectory "ConflictCase"
@@ -139,6 +160,23 @@ Write-Save "$conflict.srm" "right"
 Invoke-Converter
 Assert-True ((Read-Save "$conflict.sav") -eq "left") "Expected conflict .sav to remain untouched."
 Assert-True ((Read-Save "$conflict.srm") -eq "right") "Expected conflict .srm to remain untouched."
+
+# If a conflict is manually resolved, the losing conflict-side hash cannot return and win later.
+$resolvedConflict = Join-Path $saveDirectory "ResolvedConflict"
+Write-Save "$resolvedConflict.sav" "same"
+Write-Save "$resolvedConflict.srm" "same"
+Invoke-Converter
+Start-Sleep -Milliseconds 1100
+Write-Save "$resolvedConflict.sav" "losing-left"
+Write-Save "$resolvedConflict.srm" "chosen-right"
+Invoke-Converter
+Write-Save "$resolvedConflict.sav" "chosen-right"
+Invoke-Converter
+Write-Save "$resolvedConflict.sav" "losing-left"
+(Get-Item -LiteralPath "$resolvedConflict.sav").LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(5)
+Invoke-Converter
+Assert-True ((Read-Save "$resolvedConflict.sav") -eq "chosen-right") "Expected rejected conflict loser not to overwrite .sav."
+Assert-True ((Read-Save "$resolvedConflict.srm") -eq "chosen-right") "Expected rejected conflict loser not to overwrite .srm."
 
 # Dry-run reports work without writing files.
 $dryRun = Join-Path $saveDirectory "DryRun"
